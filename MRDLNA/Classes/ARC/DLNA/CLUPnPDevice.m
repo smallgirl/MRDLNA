@@ -35,27 +35,51 @@
 - (void)setArray:(NSArray *)array{
     @autoreleasepool {
         for (NSDictionary *dict in array) {
+            if (![dict isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            
+            // 提取基本信息
             if ([dict[@"friendlyName"] isKindOfClass:[NSString class]]) {
                 self.friendlyName = dict[@"friendlyName"];
             }
             if ([dict[@"modelName"] isKindOfClass:[NSString class]]) {
                 self.modelName = dict[@"modelName"];
             }
+            
+            // 处理 serviceList（新格式：数组）
             if ([dict[@"serviceList"] isKindOfClass:[NSArray class]]) {
                 NSArray *serviceListArray = dict[@"serviceList"];
                 for (NSDictionary *serviceDict in serviceListArray) {
+                    if (![serviceDict isKindOfClass:[NSDictionary class]]) {
+                        continue;
+                    }
+                    
+                    NSString *serviceString = nil;
+                    NSArray *children = nil;
+                    
+                    // 新格式：serviceDict 包含 "service" 和 "children"
                     if ([serviceDict[@"service"] isKindOfClass:[NSString class]]) {
-                        NSString *serviceString = serviceDict[@"service"];
+                        serviceString = serviceDict[@"service"];
+                        children = serviceDict[@"children"];
+                    }
+                    // 兼容直接包含 serviceType 的格式
+                    else if ([serviceDict[@"serviceType"] isKindOfClass:[NSString class]]) {
+                        serviceString = serviceDict[@"serviceType"];
+                        // 直接使用 serviceDict 作为 children 的来源
+                        children = @[serviceDict];
+                    }
+                    
+                    if (serviceString) {
                         if ([serviceString rangeOfString:serviceType_AVTransport].location != NSNotFound || 
                             [serviceString rangeOfString:serviceId_AVTransport].location != NSNotFound) {
-                            [self.AVTransport setArray:serviceDict[@"children"]];
+                            [self.AVTransport setArray:children];
                         } else if ([serviceString rangeOfString:serviceType_RenderingControl].location != NSNotFound || 
                                   [serviceString rangeOfString:serviceId_RenderingControl].location != NSNotFound) {
-                            [self.RenderingControl setArray:serviceDict[@"children"]];
+                            [self.RenderingControl setArray:children];
                         }
                     }
                 }
-                continue;
             }
         }
     }

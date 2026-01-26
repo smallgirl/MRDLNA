@@ -25,6 +25,7 @@
 #endif
 
 @property (nonatomic, assign) BOOL receiveDevice;
+@property (nonatomic, assign) NSInteger retryCount;
 
 @end
 
@@ -55,9 +56,16 @@
         self.receiveDevice = YES;
         _queue = dispatch_queue_create("com.mccree.upnp.dlna", DISPATCH_QUEUE_SERIAL);
         _deviceDictionary = [NSMutableDictionary dictionary];
-        _udpSocket = [[GCDAsyncUdpSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)];
+        [self setupSocket];
     }
     return self;
+}
+
+- (void)setupSocket{
+    _udpSocket = [[GCDAsyncUdpSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)];
+    // 强制使用 IPv4，因为 SSDP 多播地址 239.255.255.250 是 IPv4 地址
+    [_udpSocket setIPv4Enabled:YES];
+    [_udpSocket setIPv6Enabled:NO];
 }
 
 - (NSString *)getSearchString{
@@ -66,23 +74,66 @@
 
 - (void)start{
     NSError *error = nil;
-    if (![_udpSocket bindToPort:ssdpPort error:&error]){
-        [self onError:error];
+    
+    // 检测运行环境
+#if TARGET_OS_SIMULATOR
+    NSLog(@"[MRDLNA] ⚠️ 检测到模拟器环境，DLNA 搜索可能无法正常工作");
+    NSLog(@"[MRDLNA] ⚠️ 请使用真机测试 DLNA 功能");
+#endif
+    
+    // 如果 socket 已关闭或未初始化，重新创建
+    if (!_udpSocket || _udpSocket.isClosed) {
+        [self setupSocket];
     }
+    
+    // 检查 socket 是否已经在运行（已绑定端口）
+    // 如果是，直接发送搜索请求
+    if (_udpSocket.localPort != 0) {
+        NSLog(@"[MRDLNA] Socket already bound to port %d, sending search directly", _udpSocket.localPort);
+        [self search];
+        return;
+    }
+    
+    // 启用端口复用（iOS 16+ 需要）
+    if (![_udpSocket enableReusePort:YES error:&error]) {
+        NSLog(@"[MRDLNA] enableReusePort error: %@", error);
+        // 继续尝试，某些系统可能不支持
+    }
+    
+    // 启用广播（某些路由器需要）
+    if (![_udpSocket enableBroadcast:YES error:&error]) {
+        NSLog(@"[MRDLNA] enableBroadcast error: %@", error);
+    }
+    
+    // 绑定到随机端口而不是 SSDP 端口（避免端口冲突）
+    // SSDP 响应会发送回我们的端口，不需要绑定到 1900
+    if (![_udpSocket bindToPort:0 error:&error]){
+        NSLog(@"[MRDLNA] bindToPort error: %@", error);
+        [self onError:error];
+        return;
+    }
+    
+    NSLog(@"[MRDLNA] Socket bound to port %d", _udpSocket.localPort);
     
     if (![_udpSocket beginReceiving:&error])
     {
+        NSLog(@"[MRDLNA] beginReceiving error: %@", error);
         [self onError:error];
+        return;
     }
     
+    // 加入多播组以接收 NOTIFY 消息（可选，失败不影响主要功能）
     if (![_udpSocket joinMulticastGroup:ssdpAddres error:&error])
     {
-        [self onError:error];
+        NSLog(@"[MRDLNA] joinMulticastGroup error: %@", error);
+        // 不返回，继续搜索 - 即使加入多播组失败，M-SEARCH 响应仍然可以收到
     }
+    
     [self search];
 }
 
 - (void)stop{
+    [_udpSocket leaveMulticastGroup:ssdpAddres error:nil];
     [_udpSocket close];
 }
 
@@ -91,8 +142,18 @@
     [self.deviceDictionary removeAllObjects];
     self.receiveDevice = YES;
     [self onChange];
-    NSData * sendData = [[self getSearchString] dataUsingEncoding:NSUTF8StringEncoding];
-    [_udpSocket sendData:sendData toHost:ssdpAddres port:ssdpPort withTimeout:-1 tag:1];
+    
+    if (!_udpSocket || _udpSocket.isClosed) {
+        NSLog(@"[MRDLNA] search: socket is closed, cannot send");
+        return;
+    }
+    
+    NSString *searchString = [self getSearchString];
+    NSLog(@"[MRDLNA] 发送 M-SEARCH 到 %@:%d", ssdpAddres, ssdpPort);
+    NSLog(@"[MRDLNA] M-SEARCH 内容:\n%@", searchString);
+    
+    NSData *sendData = [searchString dataUsingEncoding:NSUTF8StringEncoding];
+    [_udpSocket sendData:sendData toHost:ssdpAddres port:ssdpPort withTimeout:5 tag:1];
 }
 
 - (NSArray<CLUPnPDevice *> *)getDeviceList{
@@ -102,20 +163,46 @@
 
 #pragma mark -- GCDAsyncUdpSocketDelegate --
 - (void)udpSocket:(GCDAsyncUdpSocket *)sock didSendDataWithTag:(long)tag{
-    CLLog(@"发送信息成功");
+    NSLog(@"[MRDLNA] M-SEARCH 发送成功，等待设备响应...");
      __weak typeof (self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(weakSelf.searchTime * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         weakSelf.receiveDevice = NO;
-        CLLog(@"搜索结束");
+        NSLog(@"[MRDLNA] 搜索结束，找到 %lu 个设备", (unsigned long)weakSelf.deviceDictionary.count);
     });
 }
 
 - (void)udpSocket:(GCDAsyncUdpSocket *)sock didNotSendDataWithTag:(long)tag dueToError:(NSError * _Nullable)error{
-    [self onError:error];
+    NSLog(@"[MRDLNA] M-SEARCH 发送失败: %@", error);
+    
+    // 如果是 "No route to host" 错误，可能是模拟器或网络问题
+    if (error.code == 65) {
+        NSLog(@"[MRDLNA] ⚠️ 'No route to host' 错误通常表示：");
+        NSLog(@"[MRDLNA]    1. 正在模拟器上运行（模拟器不支持 UDP 多播）");
+        NSLog(@"[MRDLNA]    2. WiFi 网络未连接");
+        NSLog(@"[MRDLNA]    3. 路由器开启了 AP 隔离");
+    }
+    
+    // 尝试重试（最多 2 次）
+    if (self.retryCount < 2) {
+        self.retryCount++;
+        NSLog(@"[MRDLNA] 尝试重试 (%ld/2)...", (long)self.retryCount);
+        
+        // 关闭旧 socket，重新创建
+        [_udpSocket close];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self start];
+        });
+    } else {
+        self.retryCount = 0;
+        [self onError:error];
+    }
 }
 
 - (void)udpSocketDidClose:(GCDAsyncUdpSocket *)sock withError:(NSError  * _Nullable)error{
-    CLLog(@"udpSocket关闭");
+    NSLog(@"[MRDLNA] udpSocket关闭, error: %@", error);
+    if (error) {
+        [self onError:error];
+    }
 }
 
 - (void)udpSocket:(GCDAsyncUdpSocket *)sock didReceiveData:(NSData *)data
@@ -128,24 +215,35 @@ withFilterContext:(nullable id)filterContext{
 - (void)JudgeDeviceWithData:(NSData *)data{
     @autoreleasepool {
         NSString *string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (!string) {
+            NSLog(@"[MRDLNA] 收到无法解码的数据");
+            return;
+        }
+        
+        NSLog(@"[MRDLNA] 收到响应: %@", [string substringToIndex:MIN(200, string.length)]);
+        
         if ([string hasPrefix:@"NOTIFY"]) {
             NSString *serviceType = [self headerValueForKey:@"NT:" inData:string];
+            NSLog(@"[MRDLNA] NOTIFY - NT: %@", serviceType);
+            
             if ([serviceType isEqualToString:serviceType_AVTransport]) {
                 NSString *location = [self headerValueForKey:@"Location:" inData:string];
                 NSString *usn = [self headerValueForKey:@"USN:" inData:string];
                 NSString *ssdp = [self headerValueForKey:@"NTS:" inData:string];
                 if ([self isNilString:ssdp]) {
-                    CLLog(@"ssdp = nil");
+                    NSLog(@"[MRDLNA] ssdp = nil");
                     return;
                 }
                 if ([self isNilString:usn]) {
-                    CLLog(@"usn = nil");
+                    NSLog(@"[MRDLNA] usn = nil");
                     return;
                 }
                 if ([self isNilString:location]) {
-                    CLLog(@"location = nil");
+                    NSLog(@"[MRDLNA] location = nil");
                     return;
                 }
+                NSLog(@"[MRDLNA] NOTIFY设备 - location: %@, usn: %@", location, usn);
+                
                 if ([ssdp isEqualToString:@"ssdp:alive"])
                 {
                     dispatch_async(_queue, ^{
@@ -165,17 +263,21 @@ withFilterContext:(nullable id)filterContext{
         }else if ([string hasPrefix:@"HTTP/1.1"]){
             NSString *location = [self headerValueForKey:@"Location:" inData:string];
             NSString *usn = [self headerValueForKey:@"USN:" inData:string];
+            
+            NSLog(@"[MRDLNA] HTTP响应 - location: %@, usn: %@", location, usn);
+            
             if ([self isNilString:usn]) {
-                CLLog(@"usn = nil");
+                NSLog(@"[MRDLNA] usn = nil");
                 return;
             }
             if ([self isNilString:location]) {
-                CLLog(@"location = nil");
+                NSLog(@"[MRDLNA] location = nil");
                 return;
             }
             dispatch_async(_queue, ^{
                 if ([self.deviceDictionary objectForKey:usn] == nil)
                 {
+                    NSLog(@"[MRDLNA] 正在获取设备详情: %@", location);
                     [self addDevice:[self getDeviceWithLocation:location withUSN:usn] forUSN:usn];
                 }
             });
@@ -186,8 +288,10 @@ withFilterContext:(nullable id)filterContext{
 - (void)addDevice:(CLUPnPDevice *)device forUSN:(NSString *)usn
 {
     if (!device){
+        NSLog(@"[MRDLNA] addDevice: device is nil for USN: %@", usn);
         return;
     }
+    NSLog(@"[MRDLNA] 添加设备: %@ (%@)", device.friendlyName, usn);
     [self.deviceDictionary setObject:device forKey:usn];
     [self onChange];
 }
@@ -235,27 +339,73 @@ withFilterContext:(nullable id)filterContext{
 
 - (CLUPnPDevice *)getDeviceWithLocation:(NSString *)location withUSN:(NSString *)usn
 {
+    if ([self isNilString:location]) {
+        NSLog(@"[MRDLNA] getDeviceWithLocation: location is nil");
+        return nil;
+    }
+    
     dispatch_semaphore_t seamphore = dispatch_semaphore_create(0);
     
     __block CLUPnPDevice *device = nil;
     NSURL *URL = [NSURL URLWithString:location];
+    
+    if (!URL) {
+        NSLog(@"[MRDLNA] getDeviceWithLocation: invalid URL: %@", location);
+        return nil;
+    }
+    
+    NSLog(@"[MRDLNA] 请求设备描述: %@", location);
+    
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:10.0];
     request.HTTPMethod = @"GET";
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-        if (error) {
-            [self onError:error];
-        }else{
-            if (response != nil && data != nil) {
-                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-                if (httpResponse.statusCode == 200) {
-                    NSString *xmlString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                    NSArray *array = [CLXMLParser parseXMLArray:xmlString];
-                    device = [[CLUPnPDevice alloc] init];
-                    device.uuid = usn;
-                    device.location = location;
-                    [device setArray:array];
+        @try {
+            if (error) {
+                NSLog(@"[MRDLNA] getDeviceWithLocation error: %@", error);
+            } else {
+                if (response != nil && data != nil) {
+                    NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+                    NSLog(@"[MRDLNA] 设备描述响应状态: %ld, 数据大小: %lu", (long)httpResponse.statusCode, (unsigned long)data.length);
+                    
+                    if (httpResponse.statusCode == 200) {
+                        // 尝试不同的编码
+                        NSString *xmlString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                        if (!xmlString) {
+                            // 尝试 ISO-8859-1 编码
+                            xmlString = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+                        }
+                        if (!xmlString) {
+                            NSLog(@"[MRDLNA] getDeviceWithLocation: failed to decode response");
+                            dispatch_semaphore_signal(seamphore);
+                            return;
+                        }
+                        
+                        NSLog(@"[MRDLNA] 设备XML长度: %lu", (unsigned long)xmlString.length);
+                        
+                        NSArray *array = [CLXMLParser parseXMLArray:xmlString];
+                        NSLog(@"[MRDLNA] 解析结果数组元素数: %lu", (unsigned long)array.count);
+                        
+                        if (array && array.count > 0) {
+                            device = [[CLUPnPDevice alloc] init];
+                            device.uuid = usn;
+                            device.location = [NSURL URLWithString:location];
+                            [device setArray:array];
+                            
+                            NSLog(@"[MRDLNA] 解析设备: friendlyName=%@, modelName=%@, AVTransport.controlURL=%@", 
+                                  device.friendlyName, device.modelName, device.AVTransport.controlURL);
+                            
+                            // 验证设备信息是否有效
+                            if (!device.friendlyName || device.friendlyName.length == 0) {
+                                NSLog(@"[MRDLNA] getDeviceWithLocation: device friendlyName is empty");
+                            }
+                        } else {
+                            NSLog(@"[MRDLNA] getDeviceWithLocation: failed to parse XML, array is empty");
+                        }
+                    }
                 }
             }
+        } @catch (NSException *exception) {
+            NSLog(@"[MRDLNA] getDeviceWithLocation exception: %@", exception);
         }
         dispatch_semaphore_signal(seamphore);
     }] resume];
