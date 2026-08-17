@@ -221,9 +221,24 @@
     NSString *xmlString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     NSDictionary *xmlDict = [CLXMLParser parseXMLString:xmlString];
     
-    if ([xmlDict[@"s:Body"] isKindOfClass:[NSDictionary class]]) {
-        [self resultsWith:xmlDict[@"s:Body"] postXML:postXML];
+    NSDictionary *body = nil;
+    
+    // 1. 尝试从 s:Envelope 中取 s:Body
+    NSDictionary *envelope = xmlDict[@"s:Envelope"];
+    if (envelope && [envelope isKindOfClass:[NSDictionary class]]) {
+        body = envelope[@"s:Body"];
+    }
+    
+    // 2. 如果没有 s:Envelope，直接取 s:Body（兼容旧格式）
+    if (!body) {
+        body = xmlDict[@"s:Body"];
+    }
+    
+    // 3. 如果取到了有效的 Body 字典，则继续处理
+    if (body && [body isKindOfClass:[NSDictionary class]]) {
+        [self resultsWith:body postXML:postXML];
     } else {
+        // 否则视为未定义响应
         [self _UndefinedResponse:xmlString postXML:postXML];
     }
 }

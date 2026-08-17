@@ -11,18 +11,16 @@
 
 @implementation CLUPnPAVPositionInfo
 
-- (void)setArray:(NSArray *)array {
+- (void)setDictionary:(NSDictionary *)dict {
     @autoreleasepool {
-        for (NSDictionary *dict in array) {
-            if ([dict[@"TrackDuration"] isKindOfClass:[NSString class]]) {
-                self.trackDuration = [dict[@"TrackDuration"] durationTime];
-            }
-            if ([dict[@"RelTime"] isKindOfClass:[NSString class]]) {
-                self.relTime = [dict[@"RelTime"] durationTime];
-            }
-            if ([dict[@"AbsTime"] isKindOfClass:[NSString class]]) {
-                self.absTime = [dict[@"AbsTime"] durationTime];
-            }
+        if ([dict[@"TrackDuration"] isKindOfClass:[NSString class]]) {
+            self.trackDuration = [dict[@"TrackDuration"] durationTime];
+        }
+        if ([dict[@"RelTime"] isKindOfClass:[NSString class]]) {
+            self.relTime = [dict[@"RelTime"] durationTime];
+        }
+        if ([dict[@"AbsTime"] isKindOfClass:[NSString class]]) {
+            self.absTime = [dict[@"AbsTime"] durationTime];
         }
     }
 }
@@ -31,18 +29,16 @@
 
 @implementation CLUPnPTransportInfo
 
-- (void)setArray:(NSArray *)array {
-    @autoreleasepool {        
-        for (NSDictionary *dict in array) {
-            if ([dict[@"CurrentTransportState"] isKindOfClass:[NSString class]]) {
-                self.currentTransportState = dict[@"CurrentTransportState"];
-            }
-            if ([dict[@"CurrentTransportStatus"] isKindOfClass:[NSString class]]) {
-                self.currentTransportStatus = dict[@"CurrentTransportStatus"];
-            }
-            if ([dict[@"CurrentSpeed"] isKindOfClass:[NSString class]]) {
-                self.currentSpeed = dict[@"CurrentSpeed"];
-            }
+- (void)setDictionary:(NSDictionary *)dict {
+    @autoreleasepool {
+        if ([dict[@"CurrentTransportState"] isKindOfClass:[NSString class]]) {
+            self.currentTransportState = dict[@"CurrentTransportState"];
+        }
+        if ([dict[@"CurrentTransportStatus"] isKindOfClass:[NSString class]]) {
+            self.currentTransportStatus = dict[@"CurrentTransportStatus"];
+        }
+        if ([dict[@"CurrentSpeed"] isKindOfClass:[NSString class]]) {
+            self.currentSpeed = dict[@"CurrentSpeed"];
         }
     }
 }
